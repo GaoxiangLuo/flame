@@ -44,7 +44,8 @@ class ChannelManager(object):
 
     _loop = None
 
-    _backend = None
+    _backend = None # default backend one git all
+    _backends = dict() # backend per channel
     _discovery_client = None
 
     def __new__(cls):
@@ -66,18 +67,33 @@ class ChannelManager(object):
         with background_thread_loop() as loop:
             self._loop = loop
 
-        self._backend = backend_provider.get(self._config.backend)
-        broker = self._config.brokers.sort_to_host[self._config.backend]
-        self._backend.configure(broker, self._job_id, self._task_id)
+        if self._config.channelConfigs is None:
+            self._backend = backend_provider.get(self._config.backend)
+            broker = self._config.brokers.sort_to_host[self._config.backend]
+            self._backend.configure(broker, self._job_id, self._task_id)
+        else:
+            for k, v in self._config.channelConfigs.backends.items():
+                self._backends[k] = backend_provider.get(v)
+                broker = self._config.channelConfigs.channel_brokers[k].sort_to_host[v]
+                self._backends[k].configure(broker, self._job_id, self._task_id)
         self._discovery_client = discovery_client_provider.get(
             self._config.task)
 
         async def inner():
             # create a coroutine task
-            coro = self._backend_eventq_task(self._backend.eventq())
-            _ = asyncio.create_task(coro)
+            if self._config.channelConfigs is None:
+                coro = self._backend_eventq_task(self._backend.eventq())
+                _ = asyncio.create_task(coro)
+            else:
+                for k, v in self._backends.items():
+                    coro = self._backend_eventq_task(v.eventq())
+                    _ = asyncio.create_task(coro)
 
-        _ = run_async(inner(), self._backend.loop())
+        if self._config.channelConfigs is None:
+            _ = run_async(inner(), self._backend.loop())
+        else:
+            for k, v in self._backends.items():
+                _ = run_async(inner(), v.loop())
 
         atexit.register(self.cleanup)
 
@@ -112,9 +128,15 @@ class ChannelManager(object):
 
         selector = selector_provider.get(self._config.selector.sort,
                                          **self._config.selector.kwargs)
-
-        self._channels[name] = Channel(self._backend, selector, self._job_id,
-                                       name, me, other, groupby)
+        if self._config.channelConfigs is None:
+            self._channels[name] = Channel(self._backend, selector, self._job_id,
+                                           name, me, other, groupby)
+        else:
+            if name in self._backends:
+                self._channels[name] = Channel(self._backends[name], selector, self._job_id,
+                                               name, me, other, groupby)
+            else:
+                logger.debug(f"no correspoinding backend found for channel {name}")
         self._channels[name].join()
 
     def leave(self, name):
@@ -160,5 +182,10 @@ class ChannelManager(object):
 
     def cleanup(self):
         """Clean up pending asyncio tasks."""
-        for task in asyncio.all_tasks(self._backend.loop()):
-            task.cancel()
+        if self._config.channelConfigs is None:
+            for task in asyncio.all_tasks(self._backend.loop()):
+                task.cancel()
+        else:
+            for k, v in self._backends.items():
+                for task in asyncio.all_tasks(v.loop()):
+                    task.cancel()
